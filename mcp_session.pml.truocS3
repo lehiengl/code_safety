@@ -1,0 +1,190 @@
+/*
+ * mcp_session.pml
+ * Mo hinh mot phien MCP: vong doi (initialize / initialized),
+ * tools/call co huy (notifications/cancelled) va danh sach tool
+ * thay doi dong (notifications/tools/list_changed).
+ *
+ * Tien trinh: Client (host), Server, Admin (thay doi danh sach tool).
+ *
+ * Co bien dich (bat = da sua):
+ *   FIX_INIT    client cho InitializeResult roi gui initialized truoc khi goi tool
+ *   FIX_ID      id tang don dieu, khong dung lai id con dang cho (cua so IDW)
+ *   FIX_SRV     server kiem tra tool con ton tai, kiem + thuc thi nguyen tu
+ *   FIX_SRV_NAIVE  server kiem tra nhung KHONG nguyen tu (ban sua chua du)
+ *   FIX_RETRY   client gioi han so lan thu lai khi tool bien mat
+ *   FIX_NOTIFY  server gop thong bao list_changed: chi gui lai sau khi
+ *               client da doc lai tools/list
+ *   LIVE        bat cong thuc LTL L1 (liveness)
+ *   WITNESS     bat cong thuc W (chung minh van co duong goi tool thanh cong)
+ *
+ * Tinh chat:
+ *   S1 (safety)   server chi thuc thi tool khi phien da o pha van hanh
+ *   S2 (safety)   ket qua client nhan dung la cua lan goi dang cho
+ *   S3 (safety)   server khong thuc thi tool da bi go khoi danh sach
+ *   L1 (liveness) moi lan goi tool cuoi cung deu ket thuc
+ */
+
+#define NCALL    2      /* so lan client goi tool */
+#define MAXRETRY 1      /* so lan thu lai toi da (khi FIX_RETRY) */
+#define RCAP     2      /* tran cua bien dem retry (bao hoa, tranh chu trinh gia) */
+#define IDW      8      /* cua so id: id quay vong 1..IDW; > 7 id toi da khi da sua */
+
+mtype = { INIT, INIT_RES, INITIALIZED, CALL, RESULT, ERR,
+          CANCEL, LIST, LIST_RES, LIST_CHANGED };
+
+chan c2s = [8] of { mtype, byte, byte };   /* loai, id, tag */
+chan s2c = [4] of { mtype, byte, byte };
+
+bool toolOn  = true;    /* tool co trong danh sach cua server */
+byte sPhase  = 0;       /* 0: chua init, 1: da tra InitializeResult, 2: van hanh */
+byte waitTag = 0;       /* ghost: so thu tu lan goi client dang cho */
+bool calling = false;   /* ghost: client dang o trong mot lan goi tool */
+bool gotOK   = false;   /* ghost: da co it nhat mot RESULT hop le */
+bool notified = false;  /* server da bao list_changed, client chua doc lai */
+
+#ifdef FIX_ID
+#define NEWID(x)  x = nextId; nextId = (nextId % IDW) + 1
+#else
+#define NEWID(x)  x = 2      /* cap lai id "da giai phong" */
+#endif
+
+#ifdef FIX_RETRY
+#define RETRY_OK  (retry < MAXRETRY)
+#else
+#define RETRY_OK  true
+#endif
+
+active proctype Server() {
+  mtype m; byte id, tag;
+end:
+  do
+  :: c2s?m, id, tag ->
+     if
+     :: m == INIT        -> sPhase = 1; s2c!INIT_RES, id, 0
+     :: m == INITIALIZED -> sPhase = 2
+     :: m == LIST        -> atomic { notified = false; s2c!LIST_RES, id, toolOn }
+     :: m == CANCEL      -> skip            /* MAY bo qua yeu cau huy */
+     :: m == CALL ->
+#if defined(FIX_SRV)
+        atomic {
+          if
+          :: !toolOn -> s2c!ERR, id, tag     /* -32602: unknown tool */
+          :: else ->
+             assert(sPhase == 2);            /* S1 */
+             assert(toolOn);                 /* S3 */
+             s2c!RESULT, id, tag
+          fi
+        }
+#elif defined(FIX_SRV_NAIVE)
+        if
+        :: !toolOn -> s2c!ERR, id, tag     /* -32602: unknown tool */
+        :: else ->
+           assert(sPhase == 2);              /* S1 */
+           assert(toolOn);                   /* S3 */
+           s2c!RESULT, id, tag
+        fi
+#else
+        assert(sPhase == 2);                 /* S1 */
+        assert(toolOn);                      /* S3 */
+        s2c!RESULT, id, tag
+#endif
+     fi
+  od
+}
+
+active proctype Admin() {
+end:
+  do
+  :: atomic {
+       toolOn = !toolOn;
+       if
+#ifdef FIX_NOTIFY
+       :: nfull(s2c) && !notified -> s2c!LIST_CHANGED, 0, 0; notified = true
+#else
+       :: nfull(s2c) -> s2c!LIST_CHANGED, 0, 0
+#endif
+       :: true -> skip                       /* thong bao chi la best-effort */
+       fi
+     }
+  od
+}
+
+proctype Client() {
+  mtype m; byte id, tag, cur, lid, k = 0, retry = 0;
+  byte nextId = 1;
+
+  c2s!INIT, nextId, 0; nextId++;
+#ifdef FIX_INIT
+  do
+  :: s2c?m, id, tag ->
+     if
+     :: m == INIT_RES -> break
+     :: else -> skip
+     fi
+  od;
+  c2s!INITIALIZED, 0, 0;
+#endif
+
+  do
+  :: k < NCALL ->
+     k++; retry = 0;
+     NEWID(cur);
+     atomic { waitTag = k; calling = true };
+again:
+     c2s!CALL, cur, k;
+     do
+     :: s2c?m, id, tag ->
+        if
+        :: m == INIT_RES -> c2s!INITIALIZED, 0, 0   /* chi xay ra khi chua FIX_INIT */
+        :: m == RESULT && id == cur ->
+           assert(tag == waitTag);           /* S2 */
+           gotOK = true;
+           goto finish
+        :: m == ERR && id == cur ->
+           assert(tag == waitTag);           /* S2 */
+           goto onerr
+        :: else -> skip                      /* list_changed, phan hoi cu: bo */
+        fi
+     :: c2s!CANCEL, cur, 0 -> goto finish    /* nguoi dung huy / het han */
+     od;
+onerr:
+     if
+     :: RETRY_OK ->
+        if
+        :: retry < RCAP -> retry++
+        :: else -> skip                      /* bao hoa: retry khong vuot RCAP */
+        fi;
+        NEWID(lid);
+        c2s!LIST, lid, 0;                    /* lam moi danh sach tool */
+        do
+        :: s2c?m, id, tag ->
+           if
+           :: m == INIT_RES -> c2s!INITIALIZED, 0, 0
+           :: m == LIST_RES && id == lid -> break
+           :: else -> skip
+           fi
+        od;
+        if
+        :: tag == 1 -> NEWID(cur); goto again /* tool lai xuat hien: goi lai */
+        :: else -> skip
+        fi
+     :: else -> skip                          /* bo cuoc, bao loi cho nguoi dung */
+     fi;
+finish:
+     calling = false
+  :: else -> break
+  od;
+end_drain:
+  do
+  :: s2c?m, id, tag
+  od
+}
+
+init { run Client() }
+
+#ifdef LIVE
+ltl L1 { [] (calling -> <> !calling) }
+#endif
+#ifdef WITNESS
+ltl W { [] !gotOK }
+#endif
